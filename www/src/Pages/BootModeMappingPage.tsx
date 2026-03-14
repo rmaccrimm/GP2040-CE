@@ -1,6 +1,5 @@
 import { Alert, Button, Col, Container, Form, NavItem, Row } from 'react-bootstrap';
-import { NavLink } from 'react-router-dom';
-import { memo, ReactNode, useCallback, useContext, useEffect } from 'react';
+import { memo, ReactNode, useCallback, useContext, useEffect, useState } from 'react';
 import Section from '../Components/Section';
 import {
 	useBootModeStore,
@@ -14,6 +13,11 @@ import { useTranslation } from 'react-i18next';
 import { ActionMeta, MultiValue, SingleValue } from 'react-select';
 import CaptureButton from '../Components/CaptureButton';
 import useProfilesStore from '../Store/useProfilesStore';
+import { InputMode } from '@proto/enums';
+import { FieldArray, Formik, FormikProps, useField, useFormikContext } from 'formik';
+import WebApi from '../Services/WebApi';
+import { array, boolean, number, object, ObjectSchema } from 'yup';
+import Select from 'react-select/dist/declarations/src/Select';
 
 type PinOption = {
 	label: string;
@@ -24,6 +28,31 @@ type ProfileOption = {
 	label: string;
 	value: number;
 	disabled: boolean;
+};
+
+type BootModeMapping = {
+	pins: number[];
+	inputMode?: number;
+	profileIndex?: number;
+};
+
+type FormState = {
+	webConfigPins: number[];
+	usbModePins: number[];
+	bootModes: BootModeMapping[];
+	enabled: boolean;
+};
+
+type APIResponseData = {
+	webConfigPinMask: number;
+	usbModePinMask: number;
+	enabled: boolean;
+	inputModeMappings: {
+		pinMask: number;
+		inputMode: number;
+		// Profiles are 1-indexed. 0 = no mapped profile
+		profileNumber: number;
+	}[];
 };
 
 const MAX_INPUT_MODES = 8;
@@ -44,15 +73,61 @@ const PIN_OPTIONS: PinOption[] = Array.from({ length: NUM_PINS }, (_, i) => ({
 	value: i,
 }));
 
-function BootModeSelect({ mappingKey }: { mappingKey: string }) {
-	const inputMode = useBootModeStore((state) => state.bootModes[mappingKey].inputMode);
-	const saveAttempted = useBootModeStore((state) => state.saveAttempted);
-	const { setInputMode, clearErrors, setDirty } = useBootModeStoreActions();
+const schema: ObjectSchema<FormState> = object({
+	webConfigPins: array().of(number().required()).min(1).required(),
+	usbModePins: array().of(number().required()).min(1).required(),
+	bootModes: array()
+		.of(
+			object({
+				pins: array().of(number().required()).min(1).required(),
+				inputMode: number().required(),
+				profileIndex: number().optional(),
+			}).required(),
+		)
+		.required(),
+	enabled: boolean().required(),
+});
+
+const INITIAL_STATE: FormState = {
+	webConfigPins: [],
+	usbModePins: [],
+	bootModes: [
+		{
+			pins: [],
+			inputMode: undefined,
+			profileIndex: undefined,
+		},
+		{
+			pins: [],
+			inputMode: undefined,
+			profileIndex: undefined,
+		},
+	],
+	enabled: false,
+};
+
+const saveBootModeOptions = async (state: FormState) => {
+	const postData: APIResponseData = {
+		webConfigPinMask: setToMask(state.webConfigPins),
+		usbModePinMask: setToMask(state.usbModePins),
+		enabled: state.enabled,
+		inputModeMappings: Object.entries(state.bootModes).map(([_, m], _i) => ({
+			pinMask: setToMask(m.pins),
+			inputMode: m.inputMode === undefined ? 0 : m.inputMode,
+			profileNumber: m.profileIndex === undefined ? 0 : m.profileIndex + 1,
+		})),
+	};
+	return WebApi.setBootModeOptions(postData);
+};
+
+function BootModeSelect({ name }: { name: string }) {
+	const [field, meta] = useField<number>(name);
+	const { setFieldValue } = useFormikContext();
 
 	const { getAvailablePeripherals } = useContext(AppContext);
 	const { t } = useTranslation('');
 
-	const value = INPUT_MODE_OPTIONS.find(({ value }) => value === inputMode);
+	const value = INPUT_MODE_OPTIONS.find(({ value }) => value === field.value);
 	const usbAvailable: boolean = getAvailablePeripherals('usb');
 
 	const isOptionDisabled = (option: InputModeOptions) => {
@@ -67,12 +142,10 @@ function BootModeSelect({ mappingKey }: { mappingKey: string }) {
 	};
 
 	const onChange = (option: SingleValue<InputModeOptions>) => {
-		clearErrors();
-		setInputMode(mappingKey, option?.value);
-		setDirty();
+		setFieldValue(name, option?.value);
 	};
 
-	const isInvalid = saveAttempted && !value;
+	const isInvalid = meta.touched && meta.error ? true : false;
 
 	return (
 		<CustomSelect
@@ -89,29 +162,24 @@ function BootModeSelect({ mappingKey }: { mappingKey: string }) {
 	);
 }
 
-function PinSelect({ mappingKey }: { mappingKey: string }) {
-	const pins = useBootModeStore((state) => state.bootModes[mappingKey].pins);
-	const modesWithDuplicates = useBootModeStore((state) => state.modesWithDuplicates);
-	const saveAttempted = useBootModeStore((state) => state.saveAttempted);
+function PinSelect({ name }: { name: string }) {
+	const [field, meta] = useField<number[]>(name);
+	const { setFieldValue } = useFormikContext();
 
-	const { addPin, removePin, validatePins, clearErrors, setDirty } =
-		useBootModeStoreActions();
-
-	const values = PIN_OPTIONS.filter(({ value }) => pins.has(value));
+	const values = PIN_OPTIONS.filter(({ value }) => value in field.value);
 	let errorMessage = 'Mapped GPIO pins cannot contain duplicates';
 
 	const onChange = (_: MultiValue<PinOption>, action: ActionMeta<PinOption>) => {
 		if (action.action === 'select-option' && action.option !== undefined) {
-			addPin(mappingKey, action.option.value);
+			setFieldValue(name, [...field.value, action.option.value]);
 		} else if (action.action === 'remove-value') {
-			removePin(mappingKey, action.removedValue.value);
+			setFieldValue(
+				name,
+				field.value.filter((value, _) => value != action.removedValue.value),
+			);
 		}
-		clearErrors();
-		validatePins(errorMessage);
-		setDirty();
 	};
-	const isInvalid =
-		modesWithDuplicates.includes(mappingKey) || (saveAttempted && values.length == 0);
+	const isInvalid = meta.touched && meta.error ? true : false;
 
 	return (
 		<div className="d-flex gap-2">
@@ -127,9 +195,7 @@ function PinSelect({ mappingKey }: { mappingKey: string }) {
 			<CaptureButton
 				labels={['']}
 				onChange={(_, pin) => {
-					addPin(mappingKey, pin);
-					clearErrors();
-					validatePins(errorMessage);
+					setFieldValue(name, [...field.value, pin]);
 				}}
 				small={true}
 			/>
@@ -137,7 +203,10 @@ function PinSelect({ mappingKey }: { mappingKey: string }) {
 	);
 }
 
-function ProfileSelect({ mappingKey }: { mappingKey: string }) {
+function ProfileSelect({ name }: { name: string }) {
+	const [field] = useField<number | undefined>(name);
+	const { setFieldValue } = useFormikContext();
+
 	const profiles = useProfilesStore((state) => state.profiles);
 	const profileOptions = profiles.map(({ profileLabel, enabled }, i) => ({
 		label: profileLabel,
@@ -145,11 +214,7 @@ function ProfileSelect({ mappingKey }: { mappingKey: string }) {
 		disabled: !enabled,
 	}));
 
-	const profileIndex = useBootModeStore(
-		(state) => state.bootModes[mappingKey].profileIndex,
-	);
-	const { setProfileIndex, setDirty } = useBootModeStoreActions();
-	const value = profileOptions.find(({ value }) => value === profileIndex);
+	const value = profileOptions.find(({ value }) => value === field.value);
 
 	const getLabel = (option: ProfileOption) => {
 		const label = option.label ? option.label : `Profile ${option.value + 1}`;
@@ -158,11 +223,10 @@ function ProfileSelect({ mappingKey }: { mappingKey: string }) {
 
 	const onChange = (selected: any, action: ActionMeta<ProfileOption>) => {
 		if (action.action === 'clear') {
-			setProfileIndex(mappingKey, undefined);
+			setFieldValue(name, undefined);
 		} else if (action.action === 'select-option') {
-			setProfileIndex(mappingKey, selected.value);
+			setFieldValue(name, selected.value);
 		}
-		setDirty();
 	};
 
 	return (
@@ -200,101 +264,103 @@ function FormRow({
 	);
 }
 
-function BootModeRow({ mappingKey }: { mappingKey: string }) {
-	const { removeBootMode, clearErrors, setDirty } = useBootModeStoreActions();
-
+function BootModeRow({ name, remove }: { name: string; remove: () => void }) {
 	return (
 		<FormRow
-			col0={<BootModeSelect mappingKey={mappingKey} />}
-			col1={<PinSelect mappingKey={mappingKey} />}
-			col2={<ProfileSelect mappingKey={mappingKey} />}
-			col3={
-				<Button
-					onClick={() => {
-						removeBootMode(mappingKey);
-						clearErrors();
-						setDirty();
-					}}
-				>
-					{'✕'}
-				</Button>
-			}
+			col0={<BootModeSelect name={`${name}.inputMode`} />}
+			col1={<PinSelect name={`${name}.pins`} />}
+			col2={<ProfileSelect name={`${name}.profileIndex`} />}
+			col3={<Button onClick={remove}>{'✕'}</Button>}
 		/>
 	);
 }
 
-function FixedBootModeRow({
-	label,
-	mappingKey,
-}: {
-	label: string;
-	mappingKey: 'usbMode' | 'webConfig';
-}) {
+function FixedBootModeRow({ name, label }: { name: string; label: string }) {
 	return (
 		<FormRow
 			col0={<label className="ms-2">{label}</label>}
-			col1={<PinSelect mappingKey={mappingKey} />}
+			col1={<PinSelect name={name} />}
 			col2={<CustomSelect isDisabled={true} placeholder="N/A" />}
 			col3={<Button disabled={true}>{'✕'}</Button>}
 		/>
 	);
 }
 
-export default function BootModeMappingPage() {
-	const enabled = useBootModeStore((state) => state.enabled);
-	const loadingBootModes = useBootModeStore((state) => state.loadingBootModes);
-	const bootModes = useBootModeStore((state) => state.bootModes);
-	const saveAttempted = useBootModeStore((state) => state.saveAttempted);
-	const dirty = useBootModeStore((state) => state.dirty);
-	const errorMessage = useBootModeStore((state) => state.errorMessage);
+function maskToArray(mask: number) {
+	let s: number[] = [];
+	if (mask === -1) {
+		return s;
+	}
+	for (let i = 0; i < NUM_PINS; i++) {
+		if ((1 << i) & mask) {
+			s.push(i);
+		}
+	}
+	return s;
+}
 
-	const {
-		addBootMode,
-		fetchBootModeOptions,
-		saveBootModeOptions,
-		clearErrors,
-		setEnabled,
-		setDirty,
-		validateRequired,
-	} = useBootModeStoreActions();
+function arrayToMask(pins: number[]) {
+	if (pins.length == 0) {
+		return -1;
+	}
+	return [...pins].reduce((mask, v) => mask | (1 << v), 0);
+}
 
-	const loadingProfiles = useProfilesStore((state) => state.loadingProfiles);
+function findDuplicates(bootModes: { [key: string]: BootModeMapping }) {
+	let seen: { [key: number]: string[] } = {};
+	for (const [key, mapping] of Object.entries(bootModes)) {
+		let mask = arrayToMask(mapping.pins);
+		if (mask == -1) {
+			continue;
+		}
+		if (!(mask in seen)) {
+			seen[mask] = [key];
+		} else {
+			seen[mask].push(key);
+		}
+	}
+	return Object.values(seen)
+		.filter((a) => a.length > 1)
+		.flat();
+}
+
+function Slider({ name }: { name: string }) {
+	const [field, meta] = useField(name);
+	return <input {...field} {...meta} type="checkbox" />;
+}
+
+const BootModeForm = () => {
+	const [bootModeOptions, setBootModeOptions] = useState(INITIAL_STATE);
+	const [errorMessage, setErrorMessage] = useState('');
 	const fetchProfiles = useProfilesStore((state) => state.fetchProfiles);
+
 	const { t } = useTranslation('');
 
 	useEffect(() => {
-		fetchBootModeOptions();
+		WebApi.getBootModeOptions()
+			.then(({ data }) => {
+				setBootModeOptions(data);
+			})
+			.catch((error) => {
+				console.log(error);
+				setErrorMessage('Failed to load boot mode options');
+			});
 		fetchProfiles();
 	}, []);
 
-	// The delete-able input mode keys (i.e. not web-config or usb mode)
-	const inputModeKeys = Object.keys(bootModes).filter((k) => k.startsWith('inputMode-'));
-
-	const handleSubmit = () => {
-		validateRequired('Required fields are missing');
-		saveBootModeOptions('Save Failed');
-	};
-
-	const showSaveMessage = !dirty && saveAttempted && errorMessage === undefined;
-
 	return (
-		<Section title={t('SettingsPage:boot-input-mode-label')}>
-			<Form.Check
-				label="Use GPIO Pins"
-				type="switch"
-				className="text my-auto mb-4"
-				checked={enabled}
-				onChange={(e) => {
-					setEnabled(e.target.checked);
-					setDirty();
-				}}
-			/>
-			{enabled &&
-				(loadingBootModes || loadingProfiles ? (
-					<div className="d-flex justify-content-center">
-						<span className="spinner-border" />
-					</div>
-				) : (
+		<Formik
+			initialValues={bootModeOptions}
+			onSubmit={saveBootModeOptions}
+			validationSchema={schema}
+		>
+			{({ values, handleSubmit }) => (
+				<Form
+					onSubmit={(e) => {
+						e.preventDefault();
+						handleSubmit();
+					}}
+				>
 					<Container fluid className="p-0">
 						<FormRow
 							col0={<Form.Text className="muted ms-2">MODE</Form.Text>}
@@ -304,52 +370,59 @@ export default function BootModeMappingPage() {
 						/>
 						<hr />
 						<FixedBootModeRow
+							name="webConfigPins"
 							label={t('Navigation:reboot-modal-button-web-config-label')}
-							mappingKey="webConfig"
 						/>
 						<FixedBootModeRow
+							name="usbModePins"
 							label={t('Navigation:reboot-modal-button-bootsel-label')}
-							mappingKey="usbMode"
 						/>
-						{inputModeKeys.map((k, _) => (
-							<BootModeRow mappingKey={k} key={k} />
-						))}
-
-						{inputModeKeys.length < MAX_INPUT_MODES && (
-							<div className="d-flex justify-content-center">
-								<Button
-									className="mt-1"
-									variant="outline"
-									onClick={() => {
-										addBootMode();
-										clearErrors();
-										setDirty();
-									}}
-								>
-									+ Add Mode
-								</Button>
-							</div>
-						)}
+						<FieldArray name="bootModes">
+							{({ remove, push }) => (
+								<div>
+									{values.bootModes.map((_, index) => (
+										<div key={index}>
+											<BootModeRow
+												name={`bootModes.${index}`}
+												remove={() => {
+													remove(index);
+												}}
+											></BootModeRow>
+										</div>
+									))}
+									<div className="d-flex justify-content-center">
+										{values.bootModes.length < MAX_INPUT_MODES && (
+											<Button
+												className="mt-1"
+												variant="outline"
+												onClick={() =>
+													push({
+														pins: [],
+														inputMode: undefined,
+														profileIndex: undefined,
+													})
+												}
+											>
+												+ Add Mode
+											</Button>
+										)}
+									</div>
+								</div>
+							)}
+						</FieldArray>
+						<Button type="submit">{t('Common:button-save-label')}</Button>
 					</Container>
-				))}
-			<div className="d-flex align-items-center gap-2">
-				<Button
-					onClick={handleSubmit}
-					disabled={!dirty || errorMessage !== undefined || showSaveMessage}
-				>
-					{t('Common:button-save-label')}
-				</Button>
-				{errorMessage && (
-					<div className="invalid-feedback d-block">
-						{errorMessage ? errorMessage : t('Common:saved-error-message')}
-					</div>
-				)}
-			</div>
-			{showSaveMessage && (
-				<Alert className="mt-2" variant="info">
-					{t('Common:saved-success-message')}
-				</Alert>
+				</Form>
 			)}
+		</Formik>
+	);
+};
+
+export default function BootModeMappingPage() {
+	const { t } = useTranslation('');
+	return (
+		<Section title={t('SettingsPage:boot-input-mode-label')}>
+			<BootModeForm />
 		</Section>
 	);
 }
