@@ -1,5 +1,4 @@
 import { create } from 'zustand';
-import { INPUT_MODE_OPTIONS } from '../Data/InputBootModes';
 import WebApi from '../Services/WebApi';
 import { InputMode } from '@proto/enums';
 import { nanoid } from 'nanoid';
